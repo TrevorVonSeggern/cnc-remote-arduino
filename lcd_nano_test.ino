@@ -1,8 +1,9 @@
 #include <SPI.h>
 #include <LiquidCrystal.h>
 #include <RotaryEncoder.h>
-#include <XBee.h>
 #include <Printers.h>
+
+//#define DEBUG
 
 XBeeWithCallbacks xbee;
 
@@ -29,7 +30,10 @@ bool lcd_enc_btn = false;
 const int wheel_debounce = 100;
 volatile unsigned long wheel_debounce_check_microsec = 0;
 volatile long wheel_encoder_position = 0;
-int wheel_encoder_position_prev = 0;
+long wheel_encoder_position_prev = 0;
+long wheel_tty_position = 0;
+const int wheel_tty_debounce = 100;
+unsigned long wheel_tty_time = 0;
 
 #define BTN_X 17
 #define BTN_Y 12
@@ -37,19 +41,38 @@ int wheel_encoder_position_prev = 0;
 bool xyz_btn_state[] = {false,false,false};
 bool selected_xyz[] = {true,false,false};
 
+char sd_menu_list[screenX*screenY];
+char recieve_buffer[256];
+byte recieve_buffer_end = 0;
+byte recieve_buffer_begin = 0;
+
+const char* xyz_chars = "XYZ";
+
 struct ToSendState {
-  float xyz_ticks[3];
+  long xyz_ticks[3];
 };
 ToSendState send_state;
+static void send_serial_state() {
+  Serial1.print("W:");
+  for(byte i = 0; i < 3; ++i) {
+    Serial1.print(xyz_chars[i]);
+    Serial1.print(send_state.xyz_ticks[i]);
+    Serial1.print(' ');
+  }
+  Serial1.println();
+}
+
 struct ReceivedState {
   float current_xyz[3];
 };
 ReceivedState received_state;
-
-const char* xyz_chars = "XYZ";
+ReceivedState printed_lcd_state;
 
 static void write_lcd() {
   for(byte i = 0; i < 3; ++i) {
+    if(printed_lcd_state.current_xyz[i] == received_state.current_xyz[i]) {
+      continue;
+    }
     lcd.setCursor(0, i);
     char selected = ' ';
     if(selected_xyz[i]) {
@@ -62,12 +85,12 @@ static void write_lcd() {
     }
     lcd.print(String(received_state.current_xyz[i], 2));
   }
-  lcd.setCursor(0, 3);
-  lcd.print("                    ");
-  lcd.setCursor(0, 3);
-  lcd.print((int)lcd_enc_btn);
-  lcd.print(" ");
-  lcd.print(lcd_encoder_position);
+//  lcd.setCursor(0, 3);
+//  lcd.print("                    ");
+//  lcd.setCursor(0, 3);
+//  lcd.print((int)lcd_enc_btn);
+//  lcd.print(" ");
+//  lcd.print(lcd_encoder_position);
 }
 
 void wheel_encoder_A_interrupt() {
@@ -92,46 +115,12 @@ void wheel_encoder_B_interrupt() {
 unsigned long last_xbee_time = 0;
 unsigned long last_button_time = 0;
 
-void receive16(Rx16Response& rx, uintptr_t) {
-  Tx16Request tx;
-  tx.setAddress16(rx.getRemoteAddress16());
-  tx.setPayload(rx.getFrameData() + rx.getDataOffset(), rx.getDataLength());
-  xbee.send(tx);
-  Serial.println(F("Sending Tx16Request"));
-}
-void zbReceive(ZBRxResponse& rx, uintptr_t) {
-  ZBTxRequest tx;
-  tx.setAddress64(rx.getRemoteAddress64());
-  tx.setAddress16(rx.getRemoteAddress16());
-  tx.setPayload(rx.getFrameData() + rx.getDataOffset(), rx.getDataLength());
-  xbee.send(tx);
-  Serial.println(F("Sending ZBTxRequest"));
-}
-void receive64(Rx64Response& rx, uintptr_t) {
-  Tx64Request tx;
-  tx.setAddress64(rx.getRemoteAddress64());
-  tx.setPayload(rx.getFrameData() + rx.getDataOffset(), rx.getDataLength());
-  xbee.send(tx);
-  Serial.println(F("Sending Tx64Request"));
-}
-
 void setup() {
+  #ifdef DEBUG
   Serial.begin(9600);
+  #endif
   Serial1.begin(9600);
   delay(100);
-  xbee.setSerial(Serial1);
-  xbee.onPacketError(printErrorCb, (uintptr_t)(Print*)&Serial);
-  xbee.onTxStatusResponse(printErrorCb, (uintptr_t)(Print*)&Serial);
-  xbee.onZBTxStatusResponse(printErrorCb, (uintptr_t)(Print*)&Serial);
-  xbee.onRx16Response(receive16);
-  xbee.onZBRxResponse(zbReceive);
-  xbee.onRx64Response(receive64);
-  xbee.onOtherResponse(printResponseCb, (uintptr_t)(Print*)&Serial);
-
-  uint8_t value = 0;
-  AtCommandRequest req((uint8_t*)"AO", &value, sizeof(value));
-  req.setFrameId(xbee.getNextFrameId());
-  xbee.send(req);
 
   pinMode(BTN_X, INPUT);
   pinMode(BTN_Y, INPUT);
@@ -153,8 +142,63 @@ void setup() {
   lcd.begin(screenX, screenX);
   lcd.clear();
   last_xbee_time = millis();
+  printed_lcd_state.current_xyz[0] = -1;
+  printed_lcd_state.current_xyz[1] = -1;
+  printed_lcd_state.current_xyz[2] = -1;
 
   delay(100);
+}
+
+int find_char_in_buffer(byte needle) {
+  for(byte i = recieve_buffer_begin; i != recieve_buffer_end; ++i) {
+    if(recieve_buffer[i] == needle) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+char event_buffer[256];
+void parse_events() {
+  int nl_i = find_char_in_buffer('\n');
+  if (nl_i == -1) { return; }
+  byte read_size = nl_i - recieve_buffer_begin;
+  byte e = 0;
+  for(byte i = recieve_buffer_begin; i != recieve_buffer_end; ++i) {
+    event_buffer[e++] = recieve_buffer[i];
+    #ifdef DEBUG
+    Serial.print(recieve_buffer[i]);
+    #endif
+  }
+  for(byte i = recieve_buffer_begin; i != recieve_buffer_end; ++i) {
+    recieve_buffer[i] = 0;
+  }
+  event_buffer[read_size] = 0;
+  recieve_buffer_begin = recieve_buffer_end;
+  if(read_size < 3) { return; }
+  if(event_buffer[0] == 'P' && event_buffer[1] == ':') {
+    char* pch = strtok (event_buffer + 2, " ");
+    while (pch != NULL)
+    {
+      char* num_str = pch + 1;
+      float num = atof(num_str);
+      switch(pch[0]) {
+        case 'X':
+          received_state.current_xyz[0] = num;
+          break;
+        case 'Y':
+          received_state.current_xyz[1] = num;
+          break;
+        case 'Z':
+          received_state.current_xyz[2] = num;
+          break;
+        default:
+          Serial.println("error parsing input");
+          break;
+      }
+      pch = strtok (NULL, " ");
+    }
+  }
 }
 
 #define SPLIT_LCD 100
@@ -164,6 +208,7 @@ void setup() {
 
 void loop() {
   for(unsigned long loop_counter;;++loop_counter) {
+    unsigned long t = millis();
     if(loop_counter%SPLIT_LCD == 0) {
       write_lcd();
     }
@@ -171,9 +216,12 @@ void loop() {
       lcd_encoder_position = lcd_encoder->getPosition();
     }
     if(loop_counter%SPLIT_XBEE == 0) {
-      xbee.loop();
+      if(wheel_encoder_position != wheel_tty_position && t - wheel_tty_time >= wheel_tty_debounce) {
+        wheel_tty_position = wheel_encoder_position;
+        wheel_tty_time = t;
+        send_serial_state();
+      }
     }
-    long t = millis();
     if(loop_counter%SPLIT_BUTTON == 0 && t - last_button_time > 10) {
       last_button_time = t;
       bool b_xyz[] = {digitalRead(BTN_X), digitalRead(BTN_Y), digitalRead(BTN_Z)};
@@ -198,22 +246,26 @@ void loop() {
           if(selected_xyz[i]) {
             send_state.xyz_ticks[i] += wheel_diff;
           }
-
-          // TODO - remove once we get xbee communication to set xyz position.
-          received_state.current_xyz[i] = (float)send_state.xyz_ticks[i] / 10.0f;
         }
         wheel_encoder_position_prev = wheel_encoder_position;
       }
       
       lcd_enc_btn = !digitalRead(LCD_PINS_ENC_BTN);
     }
-    if(t - last_xbee_time > 1000) {
-      Serial.println(wheel_encoder_position);
-      last_xbee_time = t;
-      Tx16Request tx;
-      tx.setAddress16(0);
-      tx.setPayload((uint8_t*)&send_state, sizeof(ToSendState));
-      xbee.send(tx);
+
+    int serial_data = -1;
+    bool new_data = false;
+    do {
+      serial_data = Serial1.read();
+      if(serial_data == -1) { break; }
+      new_data = true;
+      if(recieve_buffer_end == recieve_buffer_begin - 1)
+        recieve_buffer_begin++; // about to overflow, overwrite oldest data.
+      recieve_buffer[recieve_buffer_end++] = (byte)serial_data;
+
+    } while(serial_data != -1);
+    if(new_data) {
+      parse_events();
     }
   }
 }
